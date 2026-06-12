@@ -1,0 +1,5 @@
+Production refactor recommendations:
+- Use slm_resolver as fallback only.
+- Insert domain_resolver between regex and SLM.
+- Enhance context_window for repairs.
+- Extend safety policies.
