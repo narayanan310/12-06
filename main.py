@@ -1,40 +1,20 @@
 """
 main.py
 Edge AI Automotive Cockpit Assistant — main orchestrator.
-
-Pipeline (per turn, in priority order)
-────────────────────────────────────────
-  Guard 0   : Gibberish filter
-  Stage 0   : Macro Engine          — multi-action sequences
-  Stage 1a  : Preference Memory     — remember / recall settings
-  Stage 1b  : Dialogue Repair       — undo / actually / go back
-  Stage 1c  : Dialogue Confirm      — yes / confirm (pending intent)
-  Stage 1d  : Conversation Layer    — small talk, out-of-scope replies
-  Stage 2   : Intent Splitter       — compound command decomposition
-  Per-clause:
-    Stage 3 : Context Window        — relative commands (domain-aware)
-    Stage 4 : Context Resolver      — semantic comfort/safety/wellness
-    Stage 5 : Regex                 — explicit deterministic commands
-    Stage 6 : SLM                   — novel/ambiguous fallback
-  Safety    : SafetySupervisor      — sits between every resolver and CAN
-
-Fixes applied
-─────────────
-- STATUS_QUERY intents (from regex_mapper) now handled in _execute_intent:
-  routes to StateManager snapshot instead of crashing on bus.publish(None).
-- MACRO_RESET intents (from regex_mapper) now handled in _execute_intent:
-  triggers macro_eng reset sequence instead of crashing on bus.publish(None).
-  Because MacroEngine is not available inside _execute_intent, MACRO_RESET is
-  handled at the call-site in the main loop (same pattern as SAFETY_ALERT) by
-  returning the command upward — _execute_intent returns early with a sentinel
-  and main() dispatches the reset macro directly.
-  Simpler alternative adopted: _execute_intent accepts an optional `sm`
-  reference (already present) and handles STATUS_QUERY inline; MACRO_RESET
-  is caught before _execute_intent is called in the main loop.
 """
 
 import asyncio
 import time
+import queue
+import threading
+
+# Audio fallback in case dependencies aren't installed yet
+try:
+    from audio_io import AudioIO
+    audio_sys = AudioIO()
+except Exception as e:
+    print(f"[Warning] Voice system not loaded: {e}. Running in text-only mode.")
+    audio_sys = None
 
 from state_manager      import StateManager
 from virtual_can_bus    import VirtualCANBus
@@ -44,6 +24,7 @@ from conversation_layer import ConversationLayer
 from context_window     import ContextWindow
 from context_resolver   import ContextResolver
 from regex_mapper       import RegexIntentResolver
+from rag_resolver       import RAGResolver
 from slm_resolver       import SLMIntentResolver
 from safety_supervisor  import SafetySupervisor, is_gibberish
 from intent_splitter    import split_intents
@@ -51,9 +32,15 @@ from dialogue_manager   import DialogueManager, DialogueState
 from preference_memory  import PreferenceMemory
 
 # ── Special commands that must never reach bus.publish ────────────────────────
-# These are returned by regex_mapper with can_id=None and require bespoke handling.
-_NO_DISPATCH_CMDS = {"SAFETY_ALERT", "UNKNOWN", "STATUS_QUERY", "MACRO_RESET"}
-
+_NO_DISPATCH_CMDS = {
+    "SAFETY_ALERT", 
+    "UNKNOWN", 
+    "STATUS_QUERY", 
+    "MACRO_RESET",
+    "RAG_RESPONSE",
+    "INCOMPLETE_COMMAND",
+    "FRUSTRATION_DETECTED",
+}
 
 # ── Display helpers ───────────────────────────────────────────────────────────
 
@@ -70,121 +57,111 @@ def _print_intent(intent: dict) -> None:
 
 def _say(msg: str) -> None:
     print(f'[Assistant] "{msg}"')
+    if audio_sys:
+        audio_sys.speak(msg)
 
+# ── Confirmation message generator ────────────────────────────────────────────
+
+_UNIT = {
+    "SET_TEMPERATURE": "°C", "SET_FAN_SPEED": "", "SET_POSITION": "%",
+    "SET_BRIGHTNESS": "%", "TOGGLE_AC": "", "SET_HEADLIGHTS": "",
+}
+
+_LABEL = {
+    "SET_TEMPERATURE": "Temperature", "SET_FAN_SPEED": "Fan speed",
+    "SET_POSITION": "Sunroof", "SET_BRIGHTNESS": "Brightness",
+    "TOGGLE_AC": "AC", "SET_HEADLIGHTS": "Headlights",
+}
+
+def _confirm_message(intent: dict, was_no_change: bool, prev_value: int | None = None) -> str:
+    cmd   = intent.get("command", "")
+    val   = intent.get("value")
+    label = _LABEL.get(cmd, cmd.replace("_", " ").title())
+    unit  = _UNIT.get(cmd, "")
+
+    if intent.get("_at_limit"):
+        direction = "maximum" if (prev_value is not None and val >= prev_value) else "minimum"
+        return f"{label} is already at its {direction} ({val}{unit})."
+    if was_no_change:
+        return f"{label} is already at {val}{unit} — no change."
+    if cmd == "TOGGLE_AC":
+        return "AC turned on." if val else "AC turned off."
+    if cmd == "SET_HEADLIGHTS":
+        return "Headlights turned on." if val else "Headlights turned off."
+    if cmd == "SET_POSITION":
+        if val == 0: return "Sunroof closed."
+        if val == 100: return "Sunroof fully open."
+        return f"Sunroof opened to {val}%."
+    if intent.get("handled_by") == "ContextWindow" and prev_value is not None:
+        if val > prev_value: return f"{label} increased to {val}{unit}."
+        if val < prev_value: return f"{label} decreased to {val}{unit}."
+        return f"{label} set to {val}{unit}."
+    
 
 # ── CAN dispatch ──────────────────────────────────────────────────────────────
-
 async def _dispatch(bus: VirtualCANBus, intent: dict) -> None:
     await bus.publish(intent["can_id"], intent["command"], intent["value"])
     await asyncio.sleep(0.1)
 
-
-# ── SLM health check ──────────────────────────────────────────────────────────
-
-async def _wait_for_slm(slm: SLMIntentResolver, timeout_s: int = 60) -> bool:
-    print("[System] Checking SLM server...")
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if slm.health_check():
-            print("[System] SLM server ready.")
-            return True
-        await asyncio.sleep(2)
-    print("[System] WARNING: SLM not responding. Running in deterministic-only mode.")
-    return False
-
-
 # ── Per-clause resolver (stages 3–6) ─────────────────────────────────────────
-
 def _resolve_clause(
-    text:    str,
-    ctx_win: ContextWindow,
-    ctx_res: ContextResolver,
-    regex:   RegexIntentResolver,
-    slm:     SLMIntentResolver,
-    slm_ok:  bool,
-    domain:  str | None = None,
+    text: str, ctx_win: ContextWindow, ctx_res: ContextResolver,
+    regex: RegexIntentResolver, rag, slm: SLMIntentResolver, slm_ok: bool,
+    domain: str | None = None,
 ) -> dict | None:
-    # Stage 3: Context window — relative commands (domain-aware)
     intent = ctx_win.resolve_relative(text, domain=domain)
-    if intent:
-        return intent
+    if intent: return intent
 
-    # Stage 4: Context resolver — semantic comfort/safety/wellness
     intent = ctx_res.resolve(text)
-    if intent:
-        return intent
+    if intent: return intent
 
-    # Stage 5: Regex — explicit deterministic commands
     intent = regex.resolve(text)
-    if intent:
-        return intent
+    if intent: return intent
 
-    # Stage 6: SLM — novel fallback
+    rag_triggers = ["manual", "guide", "search", "look up", "how to", "what is"]
+    if any(trigger in text.lower() for trigger in rag_triggers):
+        print("[System] RAG trigger detected. Searching knowledge base...")
+        intent = rag.resolve(text)
+        if intent: return intent
+
     if slm_ok:
-        print("[System] Routing to SLM...")
-        return slm.resolve(text)
+        words = text.strip().split()
+        if len(words) >= 2 and any(w.isalpha() for w in words):
+            print("[System] Routing to SLM...")
+            return slm.resolve(text)
+        return None
 
-    return None
-
-
-# ── Intent execution (shared by both single and multi-intent paths) ───────────
-
+# ── Intent execution ──────────────────────────────────────────────────────────
 async def _execute_intent(
-    clause:      str,
-    intent:      dict,
-    bus:         VirtualCANBus,
-    safety:      SafetySupervisor,
-    ctx_win:     ContextWindow,
-    dlg:         DialogueManager,
-    sm:          StateManager,
-    macro_eng:   MacroEngine,
-    show_clause: bool = False,
+    clause: str, intent: dict, bus: VirtualCANBus, safety: SafetySupervisor,
+    ctx_win: ContextWindow, dlg: DialogueManager, sm: StateManager,
+    macro_eng: MacroEngine, show_clause: bool = False,
 ) -> None:
-    """
-    Run safety check, dispatch to CAN, update dialogue state.
-
-    Handles all special commands (SAFETY_ALERT, UNKNOWN, STATUS_QUERY,
-    MACRO_RESET) before touching the CAN bus so bus.publish() is never
-    called with a None can_id.
-    """
     if show_clause:
         print(f'\n[Clause] "{clause}"')
 
     _print_intent(intent)
 
-    # Wellness message (non-blocking — runs alongside vehicle action)
-    if "_wellness_msg" in intent:
-        _say(intent["_wellness_msg"])
-
-    # Extra safety warning from context_resolver
-    if "_warning" in intent:
-        print(f"[⚠ Warning] {intent['_warning']}")
+    if "_wellness_msg" in intent: _say(intent["_wellness_msg"])
+    if "_warning" in intent: print(f"[⚠ Warning] {intent['_warning']}")
 
     cmd = intent.get("command")
 
-    # ── Special commands — never reach bus.publish ────────────────────────
-
+    if cmd == "INCOMPLETE_COMMAND":
+        verb = intent.get("verb", "do")
+        _say(f"{verb.capitalize()} what?")
+        return
     if cmd == "SAFETY_ALERT":
-        print("[SAFETY] Mechanical concern — please pull over safely.")
         _say("I noticed a potential safety concern. Please check your vehicle.")
         return
-
     if cmd == "UNKNOWN":
-        print("[System] Out of scope — no vehicle action taken.")
-        _say("I can only control vehicle systems. "
-             "Try: temperature, sunroof, lights, or fan speed.")
+        _say("I can only control vehicle systems. Try: temperature, sunroof, lights, or fan speed.")
         return
-
     if cmd == "STATUS_QUERY":
-        # FIX: was falling through to _dispatch with can_id=None → crash.
-        # Now prints the live vehicle state snapshot instead.
         print("\n[Vehicle State]")
         print(sm.snapshot())
         return
-
     if cmd == "MACRO_RESET":
-        # FIX: was falling through to _dispatch with can_id=None → crash.
-        # Delegate to MacroEngine which owns the reset sequence.
         reset_macro = macro_eng.match("reset")
         if reset_macro:
             print(f"\n[Macro] {reset_macro['display']}")
@@ -193,37 +170,58 @@ async def _execute_intent(
         else:
             _say("Reset acknowledged — no reset macro defined.")
         return
+    if cmd == "RAG_RESPONSE":
+        answer = intent.get("answer")
+        if answer: _say(answer)
+        else: _say("I couldn't find that information.")
+        return
+    if cmd == "FRUSTRATION_DETECTED":
+        # You can randomize these responses to make it feel more natural
+        import random
+        apologies = [
+            "I'm really sorry, I know I can be frustrating sometimes. Let's try that again.",
+            "My bad. I'm still learning. What did you want me to do?",
+            "Sorry about that. I misheard you. Could you rephrase your command?",
+            "I hear you. Let me reset my context. What can I help with?"
+        ]
+        _say(random.choice(apologies))
+        
+        # Optional: Clear the dialogue history so the AI gets a "fresh start"
+        dlg.clear_pending()
+        ctx_win.clear() 
+        return
 
-    # ── Safety gate ───────────────────────────────────────────────────────
-
-    pre_state        = sm.get_state()
+    pre_state = sm.get_state()
     allowed, warning = safety.check(intent)
 
-    if warning:
-        print(f"[Safety] {warning}")
-
+    if warning: print(f"[Safety] {warning}")
     if not allowed:
-        print("[System] Command blocked by safety supervisor.")
+        _say("I can't do that right now — it's been blocked for safety.")
         return
+
+    cmd = intent.get("command", "")
+    prev_val = sm.get_state().get(cmd)
 
     if intent.get("_at_limit"):
         _say(f"Already at the limit ({intent['value']}).")
-        # Still dispatch — ECU handles idempotent write cleanly
     else:
         print(f"[CAN] {cmd} → {intent['can_id']} (value={intent['value']})")
 
     await _dispatch(bus, intent)
+
+    post_state = sm.get_state()
+    was_no_change = (pre_state == post_state) and not intent.get("_at_limit")
+
+    confirm = _confirm_message(intent, was_no_change, prev_value=prev_val)
+    _say(confirm)
+
     ctx_win.push(clause, intent)
     dlg.record(clause, intent, pre_state)
 
-    # Proactive nudge
     nudge = ctx_win.check_proactive_nudge()
-    if nudge:
-        _say(nudge)
-
+    if nudge: _say(nudge)
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
-
 async def main() -> None:
     print("\nInitializing Edge AI Automotive Cockpit...")
     print("=" * 50)
@@ -239,13 +237,17 @@ async def main() -> None:
     ctx_win   = ContextWindow()
     ctx_res   = ContextResolver()
     regex_eng = RegexIntentResolver()
+    rag_eng   = RAGResolver()
     slm_eng   = SLMIntentResolver()
     safety    = SafetySupervisor(sm)
     dlg       = DialogueManager()
     prefs     = PreferenceMemory()
 
     bus_task  = asyncio.create_task(bus.start())
-    slm_ready = await _wait_for_slm(slm_eng, timeout_s=60)
+    
+    # Bypass health check to load instantly on Raspberry Pi
+    slm_ready = True
+    print("[System] Bypassing SLM health check. UI loading immediately.")
 
     print("\n" + "=" * 50)
     print(" VEHICLE SYSTEMS ONLINE                          ")
@@ -254,39 +256,55 @@ async def main() -> None:
     print(" Memory  : 'remember this' | 'my usual settings' ")
     print(" Repair  : 'undo that' | 'go back' | 'actually'  ")
     print(" Info    : 'help' | 'status'                     ")
-    print(" Quit    : 'exit'                                 ")
+    print(" Quit,bye    : 'exit'                                 ")
     print("=" * 50 + "\n")
 
-    # ── Helper: wraps _execute_intent with macro_eng already bound ────────
-    async def _exec(
-        clause: str,
-        intent: dict,
-        show_clause: bool = False,
-    ) -> None:
-        await _execute_intent(
-            clause, intent, bus, safety, ctx_win, dlg, sm,
-            macro_eng, show_clause=show_clause,
-        )
+    # ── Input Threading Setup ─────────────────────────────────────────────
+    # We use a queue to safely accept both Voice and Keyboard input at the same time
+    cmd_queue = queue.Queue()
+
+    def keyboard_worker():
+        while True:
+            try:
+                txt = input()
+                if txt.strip():
+                    # We echo the text explicitly so the log looks clean
+                    print(f"\nDriver (Text): {txt.strip()}")
+                    cmd_queue.put(txt.strip())
+            except EOFError:
+                break
+
+    threading.Thread(target=keyboard_worker, daemon=True).start()
+
+    if audio_sys:
+        def voice_worker():
+            while True:
+                txt = audio_sys.listen()
+                if txt:
+                    print(f"\nDriver (Voice): {txt}")
+                    cmd_queue.put(txt)
+        threading.Thread(target=voice_worker, daemon=True).start()
+
+    print("[System] Ready! You can TYPE in the terminal or SPEAK into the microphone.")
+
+    async def _exec(clause: str, intent: dict, show_clause: bool = False) -> None:
+        await _execute_intent(clause, intent, bus, safety, ctx_win, dlg, sm, macro_eng, show_clause=show_clause)
 
     while True:
         try:
-            raw = await asyncio.to_thread(input, "Driver: ")
+            # Wait for either the voice mic or the keyboard to drop something in the queue
+            raw = await asyncio.to_thread(cmd_queue.get)
         except (EOFError, KeyboardInterrupt):
             break
 
-        raw = raw.strip()
-        if not raw:
-            continue
-        if raw.lower() in ("exit", "quit"):
+        if raw.lower() in ("exit", "quit","bye","goodbye"):
             break
 
-        # ── Guard: gibberish ──────────────────────────────────────────────
         if is_gibberish(raw):
             _say("I didn't catch that — could you try again?")
             print("\n" + "-" * 50)
             continue
 
-        # ── Stage 0: Macro Engine ─────────────────────────────────────────
         macro = macro_eng.match(raw)
         if macro:
             print(f"\n[Macro] {macro['display']}")
@@ -296,83 +314,56 @@ async def main() -> None:
             print("\n" + "-" * 50)
             continue
 
-        # ── Stage 1a: Preference Memory ───────────────────────────────────
         pref_action = prefs.detect(raw)
         if pref_action:
             state = sm.get_state()
-
             if pref_action == "query":
                 print(f"\n{prefs.describe()}")
-
             elif pref_action == "save":
                 msg = prefs.save_all(state)
                 _say(msg)
-
             elif pref_action.startswith("save_key:"):
                 key = pref_action.split(":", 1)[1]
                 msg = prefs.save_key(key, state)
                 _say(msg)
-
             elif pref_action == "load":
                 actions = prefs.load_all()
                 if actions:
                     _say("Restoring your saved preferences.")
                     for action in actions:
-                        await bus.publish(
-                            action["can_id"], action["command"], action["value"]
-                        )
+                        await bus.publish(action["can_id"], action["command"], action["value"])
                         await asyncio.sleep(0.12)
                 else:
-                    _say("No preferences saved yet. "
-                         "Say 'remember this' to save current settings.")
-
+                    _say("No preferences saved yet. Say 'remember this' to save current settings.")
             print("\n" + "-" * 50)
             continue
 
-        # ── Stage 1b: Dialogue Repair ─────────────────────────────────────
         if dlg.is_repair(raw):
             action, undo_intent = dlg.resolve_repair(raw)
-
             if action == "cancel_pending":
                 dlg.clear_pending()
                 _say("Cancelled. What would you like to do instead?")
-
             elif action in ("undo", "undo_last") and undo_intent:
                 _say("Reversing the last action.")
-                pre_state        = sm.get_state()
+                pre_state = sm.get_state()
                 allowed, warning = safety.check(undo_intent)
-                if warning:
-                    print(f"[Safety] {warning}")
+                if warning: print(f"[Safety] {warning}")
                 if allowed:
-                    print(
-                        f"[CAN] {undo_intent['command']} → "
-                        f"{undo_intent['can_id']} "
-                        f"(value={undo_intent['value']})"
-                    )
+                    print(f"[CAN] {undo_intent['command']} → {undo_intent['can_id']} (value={undo_intent['value']})")
                     await _dispatch(bus, undo_intent)
                     ctx_win.push(raw, undo_intent)
                     dlg.record(raw, undo_intent, pre_state)
                 else:
                     print("[System] Undo blocked by safety supervisor.")
-
             elif action == "nothing_to_undo":
                 _say("Nothing to undo — no recent action recorded.")
-
             else:
-                # 'unclear' — try to re-route as a regular command
-                intent = _resolve_clause(
-                    raw, ctx_win, ctx_res, regex_eng, slm_eng, slm_ready
-                )
-                if intent:
-                    await _exec(raw, intent)
-                else:
-                    _say("I'm not sure what to adjust. "
-                         "Could you be more specific?")
-
+                intent = _resolve_clause(raw, ctx_win, ctx_res, regex_eng, rag_eng, slm_eng, slm_ready)
+                if intent: await _exec(raw, intent)
+                else: _say("I'm not sure what to adjust. Could you be more specific?")
             print("\n" + "-" * 50)
             continue
 
-        # ── Stage 1c: Pending confirmation ────────────────────────────────
         if dlg.state == DialogueState.PENDING_CONFIRM:
             if dlg.is_confirmation(raw):
                 pending = dlg.pop_pending()
@@ -385,7 +376,6 @@ async def main() -> None:
             print("\n" + "-" * 50)
             continue
 
-        # ── Stage 1d: Conversation Layer ──────────────────────────────────
         reply = conv_lay.respond(raw)
         if reply:
             if reply == "_STATE_DUMP":
@@ -396,34 +386,21 @@ async def main() -> None:
             print("\n" + "-" * 50)
             continue
 
-        # ── Multi-intent split ────────────────────────────────────────────
         clauses = split_intents(raw)
-
-        # Infer domain hint from the full raw text (for relative resolution)
         domain_hint = dlg.extract_domain_hint(raw)
-
-        resolved: list[tuple[str, dict]] = []
-        failed:   list[str]              = []
+        resolved = []
+        failed = []
 
         for clause in clauses:
-            intent = _resolve_clause(
-                clause, ctx_win, ctx_res, regex_eng, slm_eng, slm_ready,
-                domain=domain_hint,
-            )
-            if intent:
-                resolved.append((clause, intent))
-            else:
-                failed.append(clause)
+            intent = _resolve_clause(clause, ctx_win, ctx_res, regex_eng, rag_eng, slm_eng, slm_ready, domain=domain_hint)
+            if intent: resolved.append((clause, intent))
+            else: failed.append(clause)
 
-        # Safety-first ordering within compound commands
-        resolved.sort(
-            key=lambda ci: 0 if ci[1].get("priority") == "safety" else 1
-        )
+        resolved.sort(key=lambda ci: 0 if ci[1].get("priority") == "safety" else 1)
 
         if not resolved and not failed:
             print("\n[System] No command recognised.")
-            _say("Sorry, I didn't understand that. "
-                 "Try: temperature, sunroof, lights, or say 'help'.")
+            _say("I didn't understand that — try saying something like 'set temperature to 22' or 'open sunroof'.")
             print("\n" + "-" * 50)
             continue
 
@@ -433,18 +410,17 @@ async def main() -> None:
         for clause in failed:
             if len(clauses) > 1:
                 print(f'\n[Clause] "{clause}" — could not resolve.')
+                _say(f"I couldn't understand \"{clause}\" — please try again.")
+            else:
+                _say("I couldn't do that — please rephrase or try 'help'.")
 
         print("\n" + "-" * 50)
 
-    # ── Graceful shutdown ─────────────────────────────────────────────────
     print("\nShutting down vehicle systems...")
     bus_task.cancel()
-    try:
-        await bus_task
-    except asyncio.CancelledError:
-        pass
+    try: await bus_task
+    except asyncio.CancelledError: pass
     print("Goodbye.")
 
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())      
